@@ -110,6 +110,40 @@ curl http://localhost:8000/v1/chat/completions \
   }'
 ```
 
+### Claude Code / Anthropic Messages API
+
+本项目同时支持 Anthropic Messages API 格式 (`/v1/messages`)，可直接用于 Claude Code：
+
+**Claude Code 配置：**
+
+```bash
+# 设置 API endpoint
+export ANTHROPIC_BASE_URL=http://localhost:8000
+
+# 设置 API key（使用 z.ai token 或 "free" 使用匿名 token）
+export ANTHROPIC_API_KEY=free
+
+# 启动 Claude Code
+claude
+```
+
+**curl 测试 Anthropic 格式：**
+
+```bash
+curl http://localhost:8000/v1/messages \
+  -H "x-api-key: free" \
+  -H "Content-Type: application/json" \
+  -H "anthropic-version: 2023-06-01" \
+  -d '{
+    "model": "claude-opus-4-6",
+    "max_tokens": 1024,
+    "messages": [{"role": "user", "content": "hello"}],
+    "stream": true
+  }'
+```
+
+> 注意：无论传入什么模型名称（如 `claude-opus-4-6`），内部实际调用的是 `GLM-5-thinking-search`。
+
 ### 多模态请求：
 
 ```json
