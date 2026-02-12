@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"strings"
 	"time"
@@ -59,6 +60,7 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 
 	enableThinking := IsThinkingModel(model)
 	autoWebSearch := IsSearchModel(model)
+	isGLM5 := IsGLM5Model(model)
 	if targetModel == "glm-4.5v" || targetModel == "glm-4.6v" {
 		autoWebSearch = false
 	}
@@ -66,6 +68,9 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 	var mcpServers []string
 	if targetModel == "glm-4.6v" {
 		mcpServers = []string{"vlm-image-search", "vlm-image-recognition", "vlm-image-processing"}
+	}
+	if isGLM5 {
+		mcpServers = []string{"advanced-search"}
 	}
 
 	urlToFileID := make(map[string]string)
@@ -97,30 +102,59 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 		upstreamMessages = append(upstreamMessages, msg.ToUpstreamMessage(urlToFileID))
 	}
 
+	features := map[string]interface{}{
+		"image_generation": false,
+		"web_search":       false,
+		"auto_web_search":  autoWebSearch,
+		"preview_mode":     true,
+		"enable_thinking":  enableThinking,
+	}
+	if isGLM5 {
+		features["flags"] = []interface{}{}
+	}
+
 	body := map[string]interface{}{
-		"stream":           true,
-		"model":            targetModel,
-		"messages":         upstreamMessages,
-		"signature_prompt": latestUserContent,
-		"params":           map[string]interface{}{},
-		"features": map[string]interface{}{
-			"image_generation": false,
-			"web_search":       false,
-			"auto_web_search":  autoWebSearch,
-			"preview_mode":     true,
-			"enable_thinking":  enableThinking,
+		"stream":                         true,
+		"model":                          targetModel,
+		"messages":                       upstreamMessages,
+		"signature_prompt":               latestUserContent,
+		"params":                         map[string]interface{}{},
+		"extra":                          map[string]interface{}{},
+		"features":                       features,
+		"chat_id":                        chatID,
+		"id":                             uuid.New().String(),
+		"current_user_message_id":        userMsgID,
+		"current_user_message_parent_id": nil,
+		"background_tasks": map[string]interface{}{
+			"title_generation": true,
+			"tags_generation":  true,
 		},
-		"chat_id": chatID,
-		"id":      uuid.New().String(),
 	}
 
 	if len(mcpServers) > 0 {
 		body["mcp_servers"] = mcpServers
 	}
 
+	if isGLM5 {
+		now := time.Now()
+		loc, _ := time.LoadLocation("Asia/Shanghai")
+		if loc != nil {
+			now = now.In(loc)
+		}
+		body["variables"] = map[string]interface{}{
+			"{{USER_NAME}}":        "Guest",
+			"{{USER_LOCATION}}":    "Unknown",
+			"{{CURRENT_DATETIME}}": now.Format("2006-01-02 15:04:05"),
+			"{{CURRENT_DATE}}":     now.Format("2006-01-02"),
+			"{{CURRENT_TIME}}":     now.Format("15:04:05"),
+			"{{CURRENT_WEEKDAY}}":  now.Weekday().String(),
+			"{{CURRENT_TIMEZONE}}": "Asia/Shanghai",
+			"{{USER_LANGUAGE}}":    "en-US",
+		}
+	}
+
 	if len(filesData) > 0 {
 		body["files"] = filesData
-		body["current_user_message_id"] = userMsgID
 	}
 
 	bodyBytes, _ := json.Marshal(body)
@@ -139,11 +173,26 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 	req.Header.Set("Referer", fmt.Sprintf("https://chat.z.ai/c/%s", uuid.New().String()))
 	req.Header.Set("User-Agent", uarand.GetRandom())
 
-	client := &http.Client{}
+	LogInfo("[Upstream] Sending request: model=%s, target=%s", model, targetModel)
+
+	client := &http.Client{
+		Transport: &http.Transport{
+			DialContext: (&net.Dialer{
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+			}).DialContext,
+			TLSHandshakeTimeout:   15 * time.Second,
+			ResponseHeaderTimeout: 60 * time.Second,
+		},
+		// 不设置全局 Timeout，因为 SSE 流式响应需要长时间读取
+	}
 	resp, err := client.Do(req)
 	if err != nil {
+		LogError("[Upstream] Request error: %v", err)
 		return nil, "", err
 	}
+
+	LogInfo("[Upstream] Response status: %d", resp.StatusCode)
 
 	return resp, targetModel, nil
 }
@@ -284,6 +333,8 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		req.Model = "GLM-4.6"
 	}
 
+	isGLM5 := IsGLM5Model(req.Model)
+
 	resp, modelName, err := makeUpstreamRequest(token, req.Messages, req.Model)
 	if err != nil {
 		LogError("Upstream request failed: %v", err)
@@ -306,13 +357,13 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	completionID := fmt.Sprintf("chatcmpl-%s", uuid.New().String()[:29])
 
 	if req.Stream {
-		handleStreamResponse(w, resp.Body, completionID, modelName)
+		handleStreamResponse(w, resp.Body, completionID, modelName, isGLM5)
 	} else {
-		handleNonStreamResponse(w, resp.Body, completionID, modelName)
+		handleNonStreamResponse(w, resp.Body, completionID, modelName, isGLM5)
 	}
 }
 
-func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionID, modelName string) {
+func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionID, modelName string, isGLM5 bool) {
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
 	w.Header().Set("Connection", "keep-alive")
@@ -354,7 +405,36 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			break
 		}
 
+		// 跳过 usage 统计数据（GLM-5 的 phase:"other" 带 usage 无内容）
+		if upstream.Data.Phase == "other" && upstream.Data.DeltaContent == "" && upstream.GetEditContent() == "" {
+			continue
+		}
+
 		if upstream.Data.Phase == "thinking" && upstream.Data.DeltaContent != "" {
+			if isGLM5 {
+				// GLM-5 thinking content is plain text, no blockquote wrapping
+				reasoningContent := upstream.Data.DeltaContent
+				reasoningContent = searchRefFilter.Process(reasoningContent)
+				if reasoningContent != "" {
+					hasContent = true
+					chunk := ChatCompletionChunk{
+						ID:      completionID,
+						Object:  "chat.completion.chunk",
+						Created: time.Now().Unix(),
+						Model:   modelName,
+						Choices: []Choice{{
+							Index:        0,
+							Delta:        Delta{ReasoningContent: reasoningContent},
+							FinishReason: nil,
+						}},
+					}
+					data, _ := json.Marshal(chunk)
+					fmt.Fprintf(w, "data: %s\n\n", data)
+					flusher.Flush()
+				}
+				continue
+			}
+
 			isNewThinkingRound := false
 			if thinkingFilter.lastPhase != "" && thinkingFilter.lastPhase != "thinking" {
 				thinkingFilter.ResetForNewRound()
@@ -667,7 +747,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 	flusher.Flush()
 }
 
-func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionID, modelName string) {
+func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionID, modelName string, isGLM5 bool) {
 	scanner := bufio.NewScanner(body)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	var chunks []string
@@ -699,6 +779,13 @@ func handleNonStreamResponse(w http.ResponseWriter, body io.ReadCloser, completi
 		}
 
 		if upstream.Data.Phase == "thinking" && upstream.Data.DeltaContent != "" {
+			if isGLM5 {
+				// GLM-5 thinking content is plain text, no blockquote wrapping
+				hasThinking = true
+				reasoningChunks = append(reasoningChunks, upstream.Data.DeltaContent)
+				continue
+			}
+
 			if thinkingFilter.lastPhase != "" && thinkingFilter.lastPhase != "thinking" {
 				thinkingFilter.ResetForNewRound()
 				thinkingFilter.thinkingRoundCount++
