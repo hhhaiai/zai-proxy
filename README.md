@@ -2,6 +2,8 @@
 
 zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换为 OpenAI API 兼容格式。用户使用自己的 z.ai token 进行调用。
 
+项目地址：https://github.com/hhhaiai/zai-proxy
+
 ## 功能特性
 
 - OpenAI API 兼容格式
@@ -20,7 +22,7 @@ zai-proxy 是一个基于 Go 语言的代理服务，将 z.ai 网页聊天转换
 
 ```bash
 # 克隆项目
-git clone https://github.com/kao0312/zai-proxy.git
+git clone https://github.com/hhhaiai/zai-proxy.git
 cd zai-proxy
 
 # 安装依赖
@@ -33,13 +35,17 @@ go run main.go
 ### Docker 一键部署
 
 ```bash
-docker run -d -p 8000:8000 ghcr.io/kao0312/zai-proxy:latest
+# 拉取最新镜像
+docker pull ghcr.io/hhhaiai/zai-proxy:latest
+
+# 启动容器
+docker run -d -p 8000:8000 ghcr.io/hhhaiai/zai-proxy:latest
 ```
 
 自定义端口和日志级别：
 
 ```bash
-docker run -d -p 8080:8000 -e LOG_LEVEL=debug ghcr.io/kao0312/zai-proxy:latest
+docker run -d -p 8080:8000 -e LOG_LEVEL=debug ghcr.io/hhhaiai/zai-proxy:latest
 ```
 
 ## 环境变量
