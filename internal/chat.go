@@ -3,11 +3,15 @@ package internal
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/url"
+	"regexp"
 	"strings"
 	"time"
 
@@ -34,7 +38,88 @@ func extractAllImageURLs(messages []Message) []string {
 	return allImageURLs
 }
 
-func makeUpstreamRequest(token string, messages []Message, model string) (*http.Response, string, error) {
+var sensitiveQueryParamRe = regexp.MustCompile(`(?i)([?&](?:token|authorization|access_token|id_token|user_id|current_url|pathname)=)[^&]*`)
+
+const (
+	maxStatus405Retries = 3
+	retry405BackoffBase = 200 * time.Millisecond
+	retry405BackoffMax  = 1200 * time.Millisecond
+)
+
+var upstreamHTTPClient = &http.Client{
+	Transport: &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: (&net.Dialer{
+			Timeout:   30 * time.Second,
+			KeepAlive: 30 * time.Second,
+		}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          200,
+		MaxIdleConnsPerHost:   100,
+		MaxConnsPerHost:       200,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   15 * time.Second,
+		ExpectContinueTimeout: 1 * time.Second,
+		ResponseHeaderTimeout: 60 * time.Second,
+	},
+	// 不设置全局 Timeout，因为 SSE 流式响应需要长时间读取
+}
+
+func redactSensitiveURL(raw string) string {
+	if raw == "" {
+		return raw
+	}
+	return sensitiveQueryParamRe.ReplaceAllString(raw, "${1}REDACTED")
+}
+
+func doUpstreamRequestWithRetry(ctx context.Context, doRequest func() (*http.Response, error), refreshVersion func(force bool)) (*http.Response, error) {
+	refreshRetryUsed := false
+	retry405Count := 0
+
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+
+		resp, err := doRequest()
+		if err != nil {
+			return nil, err
+		}
+
+		if (resp.StatusCode == http.StatusForbidden || resp.StatusCode == http.StatusUpgradeRequired) && !refreshRetryUsed {
+			LogWarn("[Upstream] Received status %d, refreshing FE version and retrying once", resp.StatusCode)
+			resp.Body.Close()
+			refreshVersion(true)
+			refreshRetryUsed = true
+			continue
+		}
+
+		if resp.StatusCode == http.StatusMethodNotAllowed && retry405Count < maxStatus405Retries {
+			retry405Count++
+			LogWarn("[Upstream] Received status %d, retrying (%d/%d)", resp.StatusCode, retry405Count, maxStatus405Retries)
+			resp.Body.Close()
+
+			backoff := retry405BackoffBase * time.Duration(1<<(retry405Count-1))
+			if backoff > retry405BackoffMax {
+				backoff = retry405BackoffMax
+			}
+			timer := time.NewTimer(backoff)
+			select {
+			case <-ctx.Done():
+				if !timer.Stop() {
+					<-timer.C
+				}
+				return nil, ctx.Err()
+			case <-timer.C:
+			}
+			continue
+		}
+
+		return resp, nil
+	}
+}
+
+func makeUpstreamRequest(ctx context.Context, token string, messages []Message, model string) (*http.Response, string, error) {
 	payload, err := DecodeJWTPayload(token)
 	if err != nil || payload == nil {
 		return nil, "", fmt.Errorf("invalid token")
@@ -42,21 +127,11 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 
 	userID := payload.ID
 	chatID := uuid.New().String()
-	timestamp := time.Now().UnixMilli()
-	requestID := uuid.New().String()
 	userMsgID := uuid.New().String()
 
 	targetModel := GetTargetModel(model)
 	latestUserContent := extractLatestUserContent(messages)
 	imageURLs := extractAllImageURLs(messages)
-
-	signature := GenerateSignature(userID, requestID, latestUserContent, timestamp)
-
-	url := fmt.Sprintf("https://chat.z.ai/api/v2/chat/completions?timestamp=%d&requestId=%s&user_id=%s&version=0.0.1&platform=web&token=%s&current_url=%s&pathname=%s&signature_timestamp=%d",
-		timestamp, requestID, userID, token,
-		fmt.Sprintf("https://chat.z.ai/c/%s", chatID),
-		fmt.Sprintf("/c/%s", chatID),
-		timestamp)
 
 	enableThinking := IsThinkingModel(model)
 	autoWebSearch := IsSearchModel(model)
@@ -157,38 +232,66 @@ func makeUpstreamRequest(token string, messages []Message, model string) (*http.
 		body["files"] = filesData
 	}
 
-	bodyBytes, _ := json.Marshal(body)
+	makeRequest := func() (*http.Request, error) {
+		timestamp := time.Now().UnixMilli()
+		requestID := uuid.New().String()
+		signature := GenerateSignature(userID, requestID, latestUserContent, timestamp)
 
-	req, err := http.NewRequest("POST", url, bytes.NewReader(bodyBytes))
-	if err != nil {
-		return nil, "", err
+		// Build upstream URL parameters without embedding auth token in query.
+		// Do not log the raw request URL to avoid sensitive metadata leakage.
+		u, err := url.Parse("https://chat.z.ai/api/v2/chat/completions")
+		if err != nil {
+			return nil, err
+		}
+		query := u.Query()
+		query.Set("timestamp", fmt.Sprintf("%d", timestamp))
+		query.Set("requestId", requestID)
+		query.Set("user_id", userID)
+		query.Set("version", GetRequestVersion())
+		query.Set("platform", "web")
+		query.Set("current_url", fmt.Sprintf("https://chat.z.ai/c/%s", chatID))
+		query.Set("pathname", fmt.Sprintf("/c/%s", chatID))
+		query.Set("signature_timestamp", fmt.Sprintf("%d", timestamp))
+		u.RawQuery = query.Encode()
+
+		bodyBytes, err := json.Marshal(body)
+		if err != nil {
+			return nil, fmt.Errorf("marshal upstream request body: %w", err)
+		}
+
+		req, err := http.NewRequestWithContext(ctx, "POST", u.String(), bytes.NewReader(bodyBytes))
+		if err != nil {
+			return nil, err
+		}
+
+		req.Header.Set("Authorization", "Bearer "+token)
+		req.Header.Set("X-FE-Version", GetFeVersion())
+		req.Header.Set("X-Signature", signature)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Connection", "keep-alive")
+		req.Header.Set("Origin", "https://chat.z.ai")
+		req.Header.Set("Referer", fmt.Sprintf("https://chat.z.ai/c/%s", uuid.New().String()))
+		req.Header.Set("User-Agent", uarand.GetRandom())
+		return req, nil
 	}
 
-	req.Header.Set("Authorization", "Bearer "+token)
-	req.Header.Set("X-FE-Version", GetFeVersion())
-	req.Header.Set("X-Signature", signature)
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Connection", "keep-alive")
-	req.Header.Set("Origin", "https://chat.z.ai")
-	req.Header.Set("Referer", fmt.Sprintf("https://chat.z.ai/c/%s", uuid.New().String()))
-	req.Header.Set("User-Agent", uarand.GetRandom())
-
-	LogInfo("[Upstream] Sending request: model=%s, target=%s", model, targetModel)
-
-	client := &http.Client{
-		Transport: &http.Transport{
-			DialContext: (&net.Dialer{
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-			}).DialContext,
-			TLSHandshakeTimeout:   15 * time.Second,
-			ResponseHeaderTimeout: 60 * time.Second,
-		},
-		// 不设置全局 Timeout，因为 SSE 流式响应需要长时间读取
+	doRequest := func() (*http.Response, error) {
+		req, err := makeRequest()
+		if err != nil {
+			return nil, err
+		}
+		resp, err := upstreamHTTPClient.Do(req)
+		if err != nil && resp != nil && resp.Body != nil {
+			resp.Body.Close()
+		}
+		return resp, err
 	}
-	resp, err := client.Do(req)
+
+	LogInfo("[Upstream] Sending request: model=%s, target=%s, token_present=%t", model, targetModel, token != "")
+
+	resp, err := doUpstreamRequestWithRetry(ctx, doRequest, RefreshFeVersionIfNeeded)
 	if err != nil {
-		LogError("[Upstream] Request error: %v", err)
+		LogError("[Upstream] Request error: %s", redactSensitiveURL(err.Error()))
 		return nil, "", err
 	}
 
@@ -306,10 +409,38 @@ func (f *ThinkingFilter) ResetForNewRound() {
 	f.hasSeenFirstThinking = false
 }
 
+func writeOpenAIInvalidAPIKey(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusUnauthorized)
+	_ = json.NewEncoder(w).Encode(map[string]interface{}{
+		"error": map[string]interface{}{
+			"message": "Incorrect API key provided.",
+			"type":    "invalid_request_error",
+			"param":   nil,
+			"code":    "invalid_api_key",
+		},
+	})
+}
+
 func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
-	token := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+	if authHeader == "" {
+		writeOpenAIInvalidAPIKey(w)
+		return
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+		writeOpenAIInvalidAPIKey(w)
+		return
+	}
+	token := strings.TrimSpace(parts[1])
 	if token == "" {
-		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		writeOpenAIInvalidAPIKey(w)
+		return
+	}
+	if strings.ContainsAny(token, " \t\r\n") {
+		writeOpenAIInvalidAPIKey(w)
 		return
 	}
 
@@ -323,8 +454,14 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		token = anonymousToken
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var req ChatRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Error(w, "Invalid request", http.StatusBadRequest)
 		return
 	}
@@ -335,21 +472,34 @@ func HandleChatCompletions(w http.ResponseWriter, r *http.Request) {
 
 	isGLM5 := IsGLM5Model(req.Model)
 
-	resp, modelName, err := makeUpstreamRequest(token, req.Messages, req.Model)
+	resp, modelName, err := makeUpstreamRequest(r.Context(), token, req.Messages, req.Model)
 	if err != nil {
-		LogError("Upstream request failed: %v", err)
+		LogError("Upstream request failed: %s", redactSensitiveURL(err.Error()))
+		if strings.Contains(strings.ToLower(err.Error()), "invalid token") {
+			writeOpenAIInvalidAPIKey(w)
+			return
+		}
 		http.Error(w, "Upstream error", http.StatusBadGateway)
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		bodyStr := string(body)
-		if len(bodyStr) > 500 {
-			bodyStr = bodyStr[:500]
+		if resp.StatusCode == http.StatusUnauthorized {
+			writeOpenAIInvalidAPIKey(w)
+			return
 		}
-		LogError("Upstream error: status=%d, body=%s", resp.StatusCode, bodyStr)
+
+		if resp.StatusCode == http.StatusForbidden {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			bodyText := strings.ToLower(string(bodyBytes))
+			if strings.Contains(bodyText, "invalid token") || strings.Contains(bodyText, "invalid api key") || strings.Contains(bodyText, "incorrect api key") {
+				writeOpenAIInvalidAPIKey(w)
+				return
+			}
+		}
+
+		LogError("Upstream error: status=%d", resp.StatusCode)
 		http.Error(w, "Upstream error", resp.StatusCode)
 		return
 	}
@@ -385,7 +535,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		LogDebug("[Upstream] %s", line)
+		LogDebug("[Upstream] stream event received")
 
 		if !strings.HasPrefix(line, "data: ") {
 			continue
@@ -424,7 +574,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 						Model:   modelName,
 						Choices: []Choice{{
 							Index:        0,
-							Delta:        Delta{ReasoningContent: reasoningContent},
+							Delta:        &Delta{ReasoningContent: reasoningContent},
 							FinishReason: nil,
 						}},
 					}
@@ -462,7 +612,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 						Model:   modelName,
 						Choices: []Choice{{
 							Index:        0,
-							Delta:        Delta{ReasoningContent: reasoningContent},
+							Delta:        &Delta{ReasoningContent: reasoningContent},
 							FinishReason: nil,
 						}},
 					}
@@ -499,7 +649,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 						Model:   modelName,
 						Choices: []Choice{{
 							Index:        0,
-							Delta:        Delta{Content: textBeforeBlock},
+							Delta:        &Delta{Content: textBeforeBlock},
 							FinishReason: nil,
 						}},
 					}
@@ -526,7 +676,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 						Model:   modelName,
 						Choices: []Choice{{
 							Index:        0,
-							Delta:        Delta{Content: textBeforeBlock},
+							Delta:        &Delta{Content: textBeforeBlock},
 							FinishReason: nil,
 						}},
 					}
@@ -550,7 +700,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 				Model:   modelName,
 				Choices: []Choice{{
 					Index:        0,
-					Delta:        Delta{Content: pendingSourcesMarkdown},
+					Delta:        &Delta{Content: pendingSourcesMarkdown},
 					FinishReason: nil,
 				}},
 			}
@@ -568,7 +718,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 				Model:   modelName,
 				Choices: []Choice{{
 					Index:        0,
-					Delta:        Delta{Content: pendingImageSearchMarkdown},
+					Delta:        &Delta{Content: pendingImageSearchMarkdown},
 					FinishReason: nil,
 				}},
 			}
@@ -593,7 +743,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 					Model:   modelName,
 					Choices: []Choice{{
 						Index:        0,
-						Delta:        Delta{ReasoningContent: processedRemaining},
+						Delta:        &Delta{ReasoningContent: processedRemaining},
 						FinishReason: nil,
 					}},
 				}
@@ -612,7 +762,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 				Model:   modelName,
 				Choices: []Choice{{
 					Index:        0,
-					Delta:        Delta{ReasoningContent: pendingSourcesMarkdown},
+					Delta:        &Delta{ReasoningContent: pendingSourcesMarkdown},
 					FinishReason: nil,
 				}},
 			}
@@ -662,7 +812,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 				Model:   modelName,
 				Choices: []Choice{{
 					Index:        0,
-					Delta:        Delta{ReasoningContent: reasoningContent},
+					Delta:        &Delta{ReasoningContent: reasoningContent},
 					FinishReason: nil,
 				}},
 			}
@@ -692,7 +842,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			Model:   modelName,
 			Choices: []Choice{{
 				Index:        0,
-				Delta:        Delta{Content: content},
+				Delta:        &Delta{Content: content},
 				FinishReason: nil,
 			}},
 		}
@@ -715,7 +865,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 			Model:   modelName,
 			Choices: []Choice{{
 				Index:        0,
-				Delta:        Delta{Content: remaining},
+				Delta:        &Delta{Content: remaining},
 				FinishReason: nil,
 			}},
 		}
@@ -736,7 +886,7 @@ func handleStreamResponse(w http.ResponseWriter, body io.ReadCloser, completionI
 		Model:   modelName,
 		Choices: []Choice{{
 			Index:        0,
-			Delta:        Delta{},
+			Delta:        &Delta{},
 			FinishReason: &stopReason,
 		}},
 	}

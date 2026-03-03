@@ -3,6 +3,7 @@ package internal
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -192,13 +193,28 @@ func resolveAnthropicModel(model string) string {
 // ==================== Handler ====================
 
 func HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
-	// Extract token from x-api-key or Authorization header
-	token := r.Header.Get("x-api-key")
+	// Extract token from x-api-key or strict Bearer Authorization header.
+	token := strings.TrimSpace(r.Header.Get("x-api-key"))
 	if token == "" {
-		token = strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+		authHeader := strings.TrimSpace(r.Header.Get("Authorization"))
+		if authHeader == "" {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+			return
+		}
+
+		parts := strings.SplitN(authHeader, " ", 2)
+		if len(parts) != 2 || !strings.EqualFold(parts[0], "Bearer") {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+			return
+		}
+		token = strings.TrimSpace(parts[1])
+		if token == "" {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+			return
+		}
 	}
-	if token == "" {
-		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Missing API key")
+	if strings.ContainsAny(token, " \t\r\n") {
+		writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
 		return
 	}
 
@@ -212,8 +228,14 @@ func HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 		token = anonymousToken
 	}
 
+	r.Body = http.MaxBytesReader(w, r.Body, 4*1024*1024)
 	var req AnthropicRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			writeAnthropicError(w, http.StatusRequestEntityTooLarge, "invalid_request_error", "Request body too large")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadRequest, "invalid_request_error", "Invalid JSON request body")
 		return
 	}
@@ -235,21 +257,34 @@ func HandleAnthropicMessages(w http.ResponseWriter, r *http.Request) {
 	isGLM5 := IsGLM5Model(req.Model)
 
 	// Make upstream request (reuse existing logic)
-	resp, _, err := makeUpstreamRequest(token, messages, req.Model)
+	resp, _, err := makeUpstreamRequest(r.Context(), token, messages, req.Model)
 	if err != nil {
-		LogError("[Anthropic] Upstream request failed: %v", err)
+		LogError("[Anthropic] Upstream request failed: %s", redactSensitiveURL(err.Error()))
+		if strings.Contains(strings.ToLower(err.Error()), "invalid token") {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+			return
+		}
 		writeAnthropicError(w, http.StatusBadGateway, "api_error", "Upstream service error")
 		return
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		bodyStr := string(body)
-		if len(bodyStr) > 500 {
-			bodyStr = bodyStr[:500]
+		if resp.StatusCode == http.StatusUnauthorized {
+			writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+			return
 		}
-		LogError("[Anthropic] Upstream error: status=%d, body=%s", resp.StatusCode, bodyStr)
+
+		if resp.StatusCode == http.StatusForbidden {
+			bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, 4096))
+			bodyText := strings.ToLower(string(bodyBytes))
+			if strings.Contains(bodyText, "invalid token") || strings.Contains(bodyText, "invalid api key") || strings.Contains(bodyText, "incorrect api key") {
+				writeAnthropicError(w, http.StatusUnauthorized, "authentication_error", "Invalid API key")
+				return
+			}
+		}
+
+		LogError("[Anthropic] Upstream error: status=%d", resp.StatusCode)
 		writeAnthropicError(w, resp.StatusCode, "api_error", "Upstream error")
 		return
 	}
@@ -314,7 +349,7 @@ func handleAnthropicStream(w http.ResponseWriter, body io.ReadCloser, msgID, mod
 
 	for scanner.Scan() {
 		line := scanner.Text()
-		LogDebug("[Anthropic][Upstream] %s", line)
+		LogDebug("[Anthropic][Upstream] stream event received")
 
 		if !strings.HasPrefix(line, "data: ") {
 			continue
