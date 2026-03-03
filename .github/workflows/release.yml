@@ -13,6 +13,7 @@ concurrency:
 
 env:
   APP_NAME: zai-proxy
+  ANDROID_NDK_VERSION: "26.3.11579264"
 
 jobs:
   build:
@@ -67,6 +68,7 @@ jobs:
             goos: android
             goarch: arm
             goarm: "7"
+            android_api: "21"
 
           - runner: macos-latest
             goos: ios
@@ -89,6 +91,18 @@ jobs:
         uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
         with:
           go-version-file: go.mod
+
+      - name: Set up Android NDK
+        if: matrix.goos == 'android' && matrix.goarch == 'arm'
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        if: matrix.goos == 'android' && matrix.goarch == 'arm'
+        shell: bash
+        run: |
+          set -euo pipefail
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "ndk;${ANDROID_NDK_VERSION}"
 
       - name: Build binary
         id: build
@@ -120,6 +134,16 @@ jobs:
             CC="$CC" \
             CGO_CFLAGS="-isysroot $SDK -arch ${{ matrix.ios_arch_flag }}" \
             CGO_LDFLAGS="-isysroot $SDK -arch ${{ matrix.ios_arch_flag }}" \
+            go build -trimpath -ldflags="-s -w" -o "dist/${BIN_FILE}" .
+          elif [[ "${{ matrix.goos }}" == "android" && "${{ matrix.goarch }}" == "arm" ]]; then
+            TOOLCHAIN_ROOT="${ANDROID_SDK_ROOT}/ndk/${ANDROID_NDK_VERSION}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+            CC="${TOOLCHAIN_ROOT}/armv7a-linux-androideabi${{ matrix.android_api }}-clang"
+
+            GOARM="${{ matrix.goarm }}" \
+            GOOS=android \
+            GOARCH=arm \
+            CGO_ENABLED=1 \
+            CC="$CC" \
             go build -trimpath -ldflags="-s -w" -o "dist/${BIN_FILE}" .
           else
             if [[ -n "${{ matrix.goarm }}" ]]; then
